@@ -79,7 +79,6 @@ public class Geoscan implements SensorEventListener {
     private boolean sensorsRegistered;
     private int currentAccuracy = SensorManager.SENSOR_STATUS_NO_CONTACT;
     private final float[] rotationMatrix = new float[9];
-    private final float[] orientationValues = new float[3];
 
     public Geoscan(Context context, LifecycleOwner lifecycleOwner, ViewGroup webViewParent, View webView) {
         this.context = context;
@@ -320,12 +319,34 @@ public class Geoscan implements SensorEventListener {
         if (orientationCallback == null) return;
 
         SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values);
-        SensorManager.getOrientation(rotationMatrix, orientationValues);
 
-        double heading = Math.toDegrees(orientationValues[0]);
+        // Derive heading/pitch/roll from the camera direction in world frame
+        // rather than from SensorManager.getOrientation(), which decomposes the
+        // rotation around body axes and produces wrong "camera tilt" values when
+        // the device is held upright (the screen plane is at ±90° to the ground,
+        // landing the standard Euler decomposition near gimbal lock). The matrix
+        // approach is orientation-agnostic.
+        //
+        // Android: v_world = R * v_body. World axes are X=East, Y=North (magnetic),
+        // Z=Up. Camera looks along -Z body, so v_world = R * (0, 0, -1):
+        //   v_world_i = -R[i*3 + 2]   (row-major 3x3).
+        double camEast = -rotationMatrix[2];
+        double camNorth = -rotationMatrix[5];
+        double camUp = -rotationMatrix[8];
+
+        // Compass heading: 0=N, 90=E, clockwise. Magnetic on Android (matches
+        // the trueHeading=false capability flag).
+        double heading = Math.toDegrees(Math.atan2(camEast, camNorth));
         if (heading < 0) heading += 360;
-        double pitch = -Math.toDegrees(orientationValues[1]);
-        double roll = Math.toDegrees(orientationValues[2]);
+
+        // Pitch: angle above horizontal (positive = camera looking up).
+        double horiz = Math.sqrt(camEast * camEast + camNorth * camNorth);
+        double pitch = Math.toDegrees(Math.atan2(camUp, horiz));
+
+        // Roll: device twist around camera axis (z-component of body X vs body Y
+        // in world frame). 0 = portrait upright; ±90 = landscape; ±180 = upside
+        // down. Same sign convention as the iOS implementation.
+        double roll = Math.toDegrees(Math.atan2(rotationMatrix[6], rotationMatrix[7]));
 
         orientationCallback.onOrientation(heading, pitch, roll,
                 accuracyToString(currentAccuracy), SystemClock.elapsedRealtime());

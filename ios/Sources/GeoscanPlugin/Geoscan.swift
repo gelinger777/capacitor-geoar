@@ -150,6 +150,9 @@ import WebKit
             preview.frame = host.bounds
             host.layer.insertSublayer(preview, at: 0)
         }
+        if let connection = preview.connection, connection.isVideoOrientationSupported {
+            connection.videoOrientation = currentVideoOrientation()
+        }
 
         DispatchQueue.global(qos: .userInitiated).async {
             session.startRunning()
@@ -160,6 +163,7 @@ import WebKit
         self.activeDevice = device
 
         startMotionUpdates(hz: config.orientationHz)
+        startObservingOrientationChanges()
 
         var result = StartResult()
         let fov = computeDisplayFov(device: device)
@@ -167,6 +171,55 @@ import WebKit
         result.verticalFovDeg = fov.v
         result.orientationHz = clampHz(config.orientationHz)
         return result
+    }
+
+    private func currentVideoOrientation() -> AVCaptureVideoOrientation {
+        if let scene = hostView?.window?.windowScene {
+            switch scene.interfaceOrientation {
+            case .portrait: return .portrait
+            case .portraitUpsideDown: return .portraitUpsideDown
+            case .landscapeLeft: return .landscapeLeft
+            case .landscapeRight: return .landscapeRight
+            default: break
+            }
+        }
+        // Fallback via UIDevice — landscape values are intentionally swapped:
+        // UIDeviceOrientation.landscapeLeft means the home button is on the right,
+        // which corresponds to AVCaptureVideoOrientation.landscapeRight.
+        switch UIDevice.current.orientation {
+        case .portrait: return .portrait
+        case .portraitUpsideDown: return .portraitUpsideDown
+        case .landscapeLeft: return .landscapeRight
+        case .landscapeRight: return .landscapeLeft
+        default: return .portrait
+        }
+    }
+
+    private func startObservingOrientationChanges() {
+        UIDevice.current.beginGeneratingDeviceOrientationNotifications()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleOrientationChange),
+            name: UIDevice.orientationDidChangeNotification,
+            object: nil)
+    }
+
+    private func stopObservingOrientationChanges() {
+        NotificationCenter.default.removeObserver(
+            self, name: UIDevice.orientationDidChangeNotification, object: nil)
+        UIDevice.current.endGeneratingDeviceOrientationNotifications()
+    }
+
+    @objc private func handleOrientationChange() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self,
+                  let preview = self.previewLayer,
+                  let host = self.hostView else { return }
+            preview.frame = host.bounds
+            if let connection = preview.connection, connection.isVideoOrientationSupported {
+                connection.videoOrientation = self.currentVideoOrientation()
+            }
+        }
     }
 
     private func computeDisplayFov(device: AVCaptureDevice) -> (h: Double, v: Double) {
@@ -216,12 +269,33 @@ import WebKit
 
         motionManager.startDeviceMotionUpdates(using: reference, to: motionQueue) { [weak self] motion, _ in
             guard let self = self, let motion = motion else { return }
-            let attitude = motion.attitude
+            // Derive heading/pitch/roll from the rotation matrix rather than from
+            // attitude.yaw/pitch/roll directly. The Euler decomposition hits gimbal
+            // lock when the device is upright in portrait (pitch ≈ ±90°) and yields
+            // wrong values for "camera tilt" outside the reference orientation.
+            // The matrix approach is orientation-agnostic.
+            let R = motion.attitude.rotationMatrix
 
-            var headingDeg = -attitude.yaw * 180 / .pi
+            // Camera looks along -Z body. With xTrueNorthZVertical: ref X = North,
+            // Y = West (right-hand rule with Z=Up, X=N), Z = Up.
+            // Camera direction in reference frame: v_ref = R^T * (0, 0, -1).
+            let camNorth = -R.m31
+            let camWest = -R.m32
+            let camUp = -R.m33
+            let camEast = -camWest
+
+            // Compass heading: 0=N, 90=E, clockwise.
+            var headingDeg = atan2(camEast, camNorth) * 180 / .pi
             if headingDeg < 0 { headingDeg += 360 }
-            let pitchDeg = attitude.pitch * 180 / .pi
-            let rollDeg = attitude.roll * 180 / .pi
+
+            // Pitch: angle above horizontal (positive = camera looking up).
+            let horiz = sqrt(camNorth * camNorth + camWest * camWest)
+            let pitchDeg = atan2(camUp, horiz) * 180 / .pi
+
+            // Roll: device twist around camera axis. 0 = portrait upright,
+            // -90 ≈ landscape with top-of-device on the right, +90 the other way,
+            // ±180 = portrait upside-down.
+            let rollDeg = atan2(R.m13, R.m23) * 180 / .pi
 
             let ts = Int64(motion.timestamp * 1000)
             let acc = self.lastAccuracy
@@ -242,6 +316,7 @@ import WebKit
     }
 
     public func stop() {
+        stopObservingOrientationChanges()
         motionManager.stopDeviceMotionUpdates()
         if headingAvailable { locationManager.stopUpdatingHeading() }
         captureSession?.stopRunning()
