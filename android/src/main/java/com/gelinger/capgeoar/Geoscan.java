@@ -156,6 +156,14 @@ public class Geoscan implements SensorEventListener {
     private void bindCameraAndComputeFov(StartConfig config, StartCallback callback)
             throws CameraAccessException {
         previewView = new PreviewView(context);
+        // Use TextureView-backed implementation (COMPATIBLE) instead of the default
+        // SurfaceView (PERFORMANCE). SurfaceView punches a hole through the window
+        // and is z-ordered separately from the regular view tree, which breaks
+        // composition with a transparent WebView above (the preview can appear
+        // clipped to a sub-region of the screen, especially under Capacitor 8's
+        // edge-to-edge layout). TextureView is a regular View and blends correctly.
+        previewView.setImplementationMode(PreviewView.ImplementationMode.COMPATIBLE);
+        previewView.setScaleType(PreviewView.ScaleType.FILL_CENTER);
         previewView.setLayoutParams(new ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT));
